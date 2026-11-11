@@ -1,0 +1,1105 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Disposable TikTo Calendar VPC, EKS, worker nodes and ALBs for Dev and Prod.
+Parameters:
+  ProjectName:
+    Type: String
+    Default: tikto
+    AllowedPattern: '[a-z][a-z0-9]{1,8}'
+  KubernetesVersion:
+    Type: String
+    Default: '1.36'
+  EksAdminCidr:
+    Type: String
+    Description: CIDR allowed to reach the public Kubernetes API, for example 203.0.113.5/32.
+  EksAdminRoleArn:
+    Type: String
+    Description: IAM role ARN used by the operator with kubectl. Use an IAM role ARN, not an STS assumed-role session ARN.
+  DevTableName:
+    Type: String
+    Default: tikto-dev-eks-app
+  ProdTableName:
+    Type: String
+    Default: tikto-prod-app
+  AvailabilityZones:
+    Type: CommaDelimitedList
+    Default: ap-southeast-2a,ap-southeast-2b,ap-southeast-2c
+    Description: Three distinct availability zones in the stack region.
+  VpcCidr:
+    Type: String
+    Default: 10.20.0.0/16
+  PublicSubnetACidr:
+    Type: String
+    Default: 10.20.0.0/24
+  PublicSubnetBCidr:
+    Type: String
+    Default: 10.20.1.0/24
+  PublicSubnetCCidr:
+    Type: String
+    Default: 10.20.2.0/24
+  NodeInstanceType:
+    Type: String
+    Default: t3.medium
+  NodeCount:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 10
+  NodeCapacityType:
+    Type: String
+    Default: ON_DEMAND
+    AllowedValues:
+    - ON_DEMAND
+    - SPOT
+  NodeDiskGiB:
+    Type: Number
+    Default: 20
+    MinValue: 20
+  EnableDevAlb:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+    - 'true'
+    - 'false'
+  EnableProdAlb:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+    - 'true'
+    - 'false'
+  ProdActiveSlot:
+    Type: String
+    Default: blue
+    AllowedValues:
+    - blue
+    - green
+    Description: Initial Prod listener target. Match the manifest backend-slot when rebuilding.
+  PreviewRunnerCidr:
+    Type: String
+    Default: ''
+    AllowedPattern: ^$|^(?!0[.]0[.]0[.]0/0$)[0-9.]+/([1-9]|[12][0-9]|3[0-2])$
+    Description: Trusted runner IPv4 CIDR. Empty disables preview listener rules.
+  GitHubOidcProviderArn:
+    Type: String
+    Default: ''
+    Description: Existing GitHub OIDC provider ARN. Empty disables the production release role.
+  EnableContainerInsights:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+    - 'true'
+    - 'false'
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues:
+    - 1
+    - 3
+    - 5
+    - 7
+    - 14
+    - 30
+    - 60
+    - 90
+Conditions:
+  HasDevAlb: !Equals [!Ref 'EnableDevAlb', 'true']
+  HasProdAlb: !Equals [!Ref 'EnableProdAlb', 'true']
+  ActiveIsGreen: !Equals [!Ref 'ProdActiveSlot', green]
+  HasPreview:
+    Fn::And:
+    - !Condition 'HasProdAlb'
+    - Fn::Not:
+      - !Equals [!Ref 'PreviewRunnerCidr', '']
+  HasReleaseRole:
+    Fn::And:
+    - !Condition 'HasPreview'
+    - Fn::Not:
+      - !Equals [!Ref 'GitHubOidcProviderArn', '']
+  HasContainerInsights: !Equals [!Ref 'EnableContainerInsights', 'true']
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref 'VpcCidr'
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+      - Key: Name
+        Value: !Sub '${ProjectName}-vpc'
+      - Key: ManagedBy
+        Value: CloudFormation
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+      - Key: Name
+        Value: !Sub '${ProjectName}-igw'
+      - Key: ManagedBy
+        Value: CloudFormation
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref 'Vpc'
+      InternetGatewayId: !Ref 'InternetGateway'
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref 'Vpc'
+      Tags:
+      - Key: Name
+        Value: !Sub '${ProjectName}-public'
+      - Key: ManagedBy
+        Value: CloudFormation
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref 'PublicRouteTable'
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref 'InternetGateway'
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref 'Vpc'
+      CidrBlock: !Ref 'PublicSubnetACidr'
+      AvailabilityZone:
+        Fn::Select:
+        - 0
+        - !Ref AvailabilityZones
+      MapPublicIpOnLaunch: true
+      Tags:
+      - Key: Name
+        Value: !Sub '${ProjectName}-public-a'
+      - Key: ManagedBy
+        Value: CloudFormation
+      - Key: kubernetes.io/role/elb
+        Value: '1'
+      - Key: !Sub 'kubernetes.io/cluster/${ProjectName}-prod-eks'
+        Value: shared
+  PublicSubnetARoute:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref 'PublicSubnetA'
+      RouteTableId: !Ref 'PublicRouteTable'
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref 'Vpc'
+      CidrBlock: !Ref 'PublicSubnetBCidr'
+      AvailabilityZone:
+        Fn::Select:
+        - 1
+        - !Ref AvailabilityZones
+      MapPublicIpOnLaunch: true
+      Tags:
+      - Key: Name
+        Value: !Sub '${ProjectName}-public-b'
+      - Key: ManagedBy
+        Value: CloudFormation
+      - Key: kubernetes.io/role/elb
+        Value: '1'
+      - Key: !Sub 'kubernetes.io/cluster/${ProjectName}-prod-eks'
+        Value: shared
+  PublicSubnetBRoute:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref 'PublicSubnetB'
+      RouteTableId: !Ref 'PublicRouteTable'
+  PublicSubnetC:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref 'Vpc'
+      CidrBlock: !Ref 'PublicSubnetCCidr'
+      AvailabilityZone:
+        Fn::Select:
+        - 2
+        - !Ref AvailabilityZones
+      MapPublicIpOnLaunch: true
+      Tags:
+      - Key: Name
+        Value: !Sub '${ProjectName}-public-c'
+      - Key: ManagedBy
+        Value: CloudFormation
+      - Key: kubernetes.io/role/elb
+        Value: '1'
+      - Key: !Sub 'kubernetes.io/cluster/${ProjectName}-prod-eks'
+        Value: shared
+  PublicSubnetCRoute:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref 'PublicSubnetC'
+      RouteTableId: !Ref 'PublicRouteTable'
+  ClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: eks.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonEKSClusterPolicy'
+  NodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: ec2.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonEKSWorkerNodePolicy'
+      - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonEC2ContainerRegistryPullOnly'
+      - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonEKS_CNI_Policy'
+  ClusterLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/eks/${ProjectName}-prod-eks/cluster'
+      RetentionInDays: !Ref 'LogRetentionDays'
+  Cluster:
+    Type: AWS::EKS::Cluster
+    DependsOn:
+    - ClusterLogGroup
+    - PublicRoute
+    - PublicSubnetARoute
+    - PublicSubnetBRoute
+    - PublicSubnetCRoute
+    Properties:
+      Name: !Sub '${ProjectName}-prod-eks'
+      Version: !Ref 'KubernetesVersion'
+      RoleArn: !GetAtt 'ClusterRole.Arn'
+      UpgradePolicy:
+        SupportType: STANDARD
+      AccessConfig:
+        AuthenticationMode: API_AND_CONFIG_MAP
+        BootstrapClusterCreatorAdminPermissions: false
+      ResourcesVpcConfig:
+        SubnetIds:
+        - !Ref 'PublicSubnetA'
+        - !Ref 'PublicSubnetB'
+        - !Ref 'PublicSubnetC'
+        EndpointPrivateAccess: true
+        EndpointPublicAccess: true
+        PublicAccessCidrs:
+        - !Ref 'EksAdminCidr'
+      Logging:
+        ClusterLogging:
+          EnabledTypes:
+          - Type: api
+          - Type: audit
+          - Type: authenticator
+          - Type: controllerManager
+          - Type: scheduler
+      Tags:
+      - Key: Name
+        Value: !Sub '${ProjectName}-prod-eks'
+      - Key: ManagedBy
+        Value: CloudFormation
+  OperatorAccess:
+    Type: AWS::EKS::AccessEntry
+    Properties:
+      ClusterName: !Ref 'Cluster'
+      PrincipalArn: !Ref 'EksAdminRoleArn'
+      Type: STANDARD
+      AccessPolicies:
+      - PolicyArn: !Sub 'arn:${AWS::Partition}:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy'
+        AccessScope:
+          Type: cluster
+  NodeLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+          HttpPutResponseHopLimit: 2
+        BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: !Ref 'NodeDiskGiB'
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: true
+        TagSpecifications:
+        - ResourceType: instance
+          Tags:
+          - Key: Name
+            Value: !Sub '${ProjectName}-eks-worker'
+          - Key: ManagedBy
+            Value: CloudFormation
+        - ResourceType: volume
+          Tags:
+          - Key: Name
+            Value: !Sub '${ProjectName}-eks-worker'
+          - Key: ManagedBy
+            Value: CloudFormation
+  VpcCni:
+    Type: AWS::EKS::Addon
+    DependsOn: NodeGroup
+    Properties:
+      ClusterName: !Ref 'Cluster'
+      AddonName: vpc-cni
+      ResolveConflicts: OVERWRITE
+  KubeProxy:
+    Type: AWS::EKS::Addon
+    DependsOn: NodeGroup
+    Properties:
+      ClusterName: !Ref 'Cluster'
+      AddonName: kube-proxy
+      ResolveConflicts: OVERWRITE
+  CoreDns:
+    Type: AWS::EKS::Addon
+    DependsOn: NodeGroup
+    Properties:
+      ClusterName: !Ref 'Cluster'
+      AddonName: coredns
+      ResolveConflicts: OVERWRITE
+  PodIdentityAgent:
+    Type: AWS::EKS::Addon
+    DependsOn: NodeGroup
+    Properties:
+      ClusterName: !Ref 'Cluster'
+      AddonName: eks-pod-identity-agent
+      ResolveConflicts: OVERWRITE
+  NodeGroup:
+    Type: AWS::EKS::Nodegroup
+    Properties:
+      ClusterName: !Ref 'Cluster'
+      NodegroupName: system
+      NodeRole: !GetAtt 'NodeRole.Arn'
+      AmiType: AL2023_x86_64_STANDARD
+      Subnets:
+      - !Ref 'PublicSubnetA'
+      - !Ref 'PublicSubnetB'
+      - !Ref 'PublicSubnetC'
+      CapacityType: !Ref 'NodeCapacityType'
+      InstanceTypes:
+      - !Ref 'NodeInstanceType'
+      ScalingConfig:
+        MinSize: !Ref 'NodeCount'
+        DesiredSize: !Ref 'NodeCount'
+        MaxSize: !Ref 'NodeCount'
+      UpdateConfig:
+        MaxUnavailable: 1
+      LaunchTemplate:
+        Id: !Ref 'NodeLaunchTemplate'
+        Version: !GetAtt 'NodeLaunchTemplate.LatestVersionNumber'
+      Tags:
+        ManagedBy: CloudFormation
+  DevApplicationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: pods.eks.amazonaws.com
+          Action:
+          - sts:AssumeRole
+          - sts:TagSession
+      Policies:
+      - PolicyName: PlannerTable
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - dynamodb:GetItem
+            - dynamodb:PutItem
+            - dynamodb:DeleteItem
+            - dynamodb:Query
+            - dynamodb:UpdateItem
+            Resource:
+            - !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${DevTableName}'
+            - !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${DevTableName}/index/*'
+  DevApplicationIdentity:
+    Type: AWS::EKS::PodIdentityAssociation
+    DependsOn: PodIdentityAgent
+    Properties:
+      ClusterName: !Ref 'Cluster'
+      Namespace: tikto-dev
+      ServiceAccount: tikto-app
+      RoleArn: !GetAtt 'DevApplicationRole.Arn'
+  ProdApplicationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: pods.eks.amazonaws.com
+          Action:
+          - sts:AssumeRole
+          - sts:TagSession
+      Policies:
+      - PolicyName: PlannerTable
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - dynamodb:GetItem
+            - dynamodb:PutItem
+            - dynamodb:DeleteItem
+            - dynamodb:Query
+            - dynamodb:UpdateItem
+            Resource:
+            - !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ProdTableName}'
+            - !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ProdTableName}/index/*'
+  ProdApplicationIdentity:
+    Type: AWS::EKS::PodIdentityAssociation
+    DependsOn: PodIdentityAgent
+    Properties:
+      ClusterName: !Ref 'Cluster'
+      Namespace: tikto-prod
+      ServiceAccount: tikto-app
+      RoleArn: !GetAtt 'ProdApplicationRole.Arn'
+  AlbControllerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: pods.eks.amazonaws.com
+          Action:
+          - sts:AssumeRole
+          - sts:TagSession
+      Policies:
+      - PolicyName: AWSLoadBalancerController
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action: iam:CreateServiceLinkedRole
+            Resource: '*'
+            Condition:
+              StringEquals:
+                iam:AWSServiceName: elasticloadbalancing.amazonaws.com
+          - Effect: Allow
+            Action:
+            - ec2:DescribeAccountAttributes
+            - ec2:DescribeAddresses
+            - ec2:DescribeAvailabilityZones
+            - ec2:DescribeCoipPools
+            - ec2:DescribeInstances
+            - ec2:DescribeInternetGateways
+            - ec2:DescribeIpamPools
+            - ec2:DescribeNetworkInterfaces
+            - ec2:DescribeRouteTables
+            - ec2:DescribeSecurityGroups
+            - ec2:DescribeSubnets
+            - ec2:DescribeTags
+            - ec2:DescribeVpcPeeringConnections
+            - ec2:DescribeVpcs
+            - ec2:GetCoipPoolUsage
+            - ec2:GetSecurityGroupsForVpc
+            - elasticloadbalancing:DescribeCapacityReservation
+            - elasticloadbalancing:DescribeListenerAttributes
+            - elasticloadbalancing:DescribeListenerCertificates
+            - elasticloadbalancing:DescribeListeners
+            - elasticloadbalancing:DescribeLoadBalancerAttributes
+            - elasticloadbalancing:DescribeLoadBalancers
+            - elasticloadbalancing:DescribeRules
+            - elasticloadbalancing:DescribeSSLPolicies
+            - elasticloadbalancing:DescribeTags
+            - elasticloadbalancing:DescribeTargetGroupAttributes
+            - elasticloadbalancing:DescribeTargetGroups
+            - elasticloadbalancing:DescribeTargetHealth
+            - elasticloadbalancing:DescribeTrustStores
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - acm:DescribeCertificate
+            - acm:ListCertificates
+            - cognito-idp:DescribeUserPoolClient
+            - iam:GetServerCertificate
+            - iam:ListServerCertificates
+            - shield:CreateProtection
+            - shield:DeleteProtection
+            - shield:DescribeProtection
+            - shield:GetSubscriptionState
+            - waf-regional:AssociateWebACL
+            - waf-regional:DisassociateWebACL
+            - waf-regional:GetWebACL
+            - waf-regional:GetWebACLForResource
+            - wafv2:AssociateWebACL
+            - wafv2:DisassociateWebACL
+            - wafv2:GetWebACL
+            - wafv2:GetWebACLForResource
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - ec2:AuthorizeSecurityGroupIngress
+            - ec2:RevokeSecurityGroupIngress
+            Resource: '*'
+          - Effect: Allow
+            Action: ec2:CreateSecurityGroup
+            Resource: '*'
+          - Effect: Allow
+            Action: ec2:CreateTags
+            Resource: arn:aws:ec2:*:*:security-group/*
+            Condition:
+              StringEquals:
+                ec2:CreateAction: CreateSecurityGroup
+              'Null':
+                aws:RequestTag/elbv2.k8s.aws/cluster: 'false'
+          - Effect: Allow
+            Action:
+            - ec2:CreateTags
+            - ec2:DeleteTags
+            Resource: arn:aws:ec2:*:*:security-group/*
+            Condition:
+              'Null':
+                aws:RequestTag/elbv2.k8s.aws/cluster: 'true'
+                aws:ResourceTag/elbv2.k8s.aws/cluster: 'false'
+          - Effect: Allow
+            Action:
+            - ec2:AuthorizeSecurityGroupIngress
+            - ec2:DeleteSecurityGroup
+            - ec2:RevokeSecurityGroupIngress
+            Resource: '*'
+            Condition:
+              'Null':
+                aws:ResourceTag/elbv2.k8s.aws/cluster: 'false'
+          - Effect: Allow
+            Action:
+            - elasticloadbalancing:CreateLoadBalancer
+            - elasticloadbalancing:CreateTargetGroup
+            Resource: '*'
+            Condition:
+              'Null':
+                aws:RequestTag/elbv2.k8s.aws/cluster: 'false'
+          - Effect: Allow
+            Action:
+            - elasticloadbalancing:CreateListener
+            - elasticloadbalancing:CreateRule
+            - elasticloadbalancing:DeleteListener
+            - elasticloadbalancing:DeleteRule
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - elasticloadbalancing:AddTags
+            - elasticloadbalancing:RemoveTags
+            Resource:
+            - arn:aws:elasticloadbalancing:*:*:loadbalancer/app/*/*
+            - arn:aws:elasticloadbalancing:*:*:loadbalancer/net/*/*
+            - arn:aws:elasticloadbalancing:*:*:targetgroup/*/*
+            Condition:
+              'Null':
+                aws:RequestTag/elbv2.k8s.aws/cluster: 'true'
+                aws:ResourceTag/elbv2.k8s.aws/cluster: 'false'
+          - Effect: Allow
+            Action:
+            - elasticloadbalancing:AddTags
+            - elasticloadbalancing:RemoveTags
+            Resource:
+            - arn:aws:elasticloadbalancing:*:*:listener-rule/app/*/*/*
+            - arn:aws:elasticloadbalancing:*:*:listener-rule/net/*/*/*
+            - arn:aws:elasticloadbalancing:*:*:listener/app/*/*/*
+            - arn:aws:elasticloadbalancing:*:*:listener/net/*/*/*
+          - Effect: Allow
+            Action:
+            - elasticloadbalancing:DeleteLoadBalancer
+            - elasticloadbalancing:DeleteTargetGroup
+            - elasticloadbalancing:ModifyCapacityReservation
+            - elasticloadbalancing:ModifyIpPools
+            - elasticloadbalancing:ModifyListenerAttributes
+            - elasticloadbalancing:ModifyLoadBalancerAttributes
+            - elasticloadbalancing:ModifyTargetGroup
+            - elasticloadbalancing:ModifyTargetGroupAttributes
+            - elasticloadbalancing:SetIpAddressType
+            - elasticloadbalancing:SetSecurityGroups
+            - elasticloadbalancing:SetSubnets
+            Resource: '*'
+            Condition:
+              'Null':
+                aws:ResourceTag/elbv2.k8s.aws/cluster: 'false'
+          - Effect: Allow
+            Action: elasticloadbalancing:AddTags
+            Resource:
+            - arn:aws:elasticloadbalancing:*:*:loadbalancer/app/*/*
+            - arn:aws:elasticloadbalancing:*:*:loadbalancer/net/*/*
+            - arn:aws:elasticloadbalancing:*:*:targetgroup/*/*
+            Condition:
+              StringEquals:
+                elasticloadbalancing:CreateAction:
+                - CreateLoadBalancer
+                - CreateTargetGroup
+              'Null':
+                aws:RequestTag/elbv2.k8s.aws/cluster: 'false'
+          - Effect: Allow
+            Action:
+            - elasticloadbalancing:DeregisterTargets
+            - elasticloadbalancing:RegisterTargets
+            Resource: arn:aws:elasticloadbalancing:*:*:targetgroup/*/*
+          - Effect: Allow
+            Action:
+            - elasticloadbalancing:AddListenerCertificates
+            - elasticloadbalancing:ModifyListener
+            - elasticloadbalancing:ModifyRule
+            - elasticloadbalancing:RemoveListenerCertificates
+            - elasticloadbalancing:SetRulePriorities
+            - elasticloadbalancing:SetWebAcl
+            Resource: '*'
+  AlbControllerIdentity:
+    Type: AWS::EKS::PodIdentityAssociation
+    DependsOn: PodIdentityAgent
+    Properties:
+      ClusterName: !Ref 'Cluster'
+      Namespace: kube-system
+      ServiceAccount: aws-load-balancer-controller
+      RoleArn: !GetAtt 'AlbControllerRole.Arn'
+  DevAlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: HasDevAlb
+    Properties:
+      GroupDescription: TikTo Dev public ALB
+      VpcId: !Ref 'Vpc'
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+      - IpProtocol: tcp
+        FromPort: 8080
+        ToPort: 8080
+        CidrIp: !Ref 'VpcCidr'
+      - IpProtocol: tcp
+        FromPort: 3000
+        ToPort: 3000
+        CidrIp: !Ref 'VpcCidr'
+  DevAllowFrontend:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasDevAlb
+    Properties:
+      GroupId: !GetAtt 'Cluster.ClusterSecurityGroupId'
+      SourceSecurityGroupId: !Ref 'DevAlbSecurityGroup'
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+  DevAllowBackend:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasDevAlb
+    Properties:
+      GroupId: !GetAtt 'Cluster.ClusterSecurityGroupId'
+      SourceSecurityGroupId: !Ref 'DevAlbSecurityGroup'
+      IpProtocol: tcp
+      FromPort: 3000
+      ToPort: 3000
+  DevAlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Condition: HasDevAlb
+    DependsOn:
+    - PublicRoute
+    - PublicSubnetARoute
+    - PublicSubnetBRoute
+    - PublicSubnetCRoute
+    Properties:
+      Name: !Sub '${ProjectName}-dev-eks-edge'
+      Type: application
+      Scheme: internet-facing
+      Subnets:
+      - !Ref 'PublicSubnetA'
+      - !Ref 'PublicSubnetB'
+      - !Ref 'PublicSubnetC'
+      SecurityGroups:
+      - !Ref 'DevAlbSecurityGroup'
+  DevFrontendTarget:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: HasDevAlb
+    Properties:
+      Name: !Sub '${ProjectName}-dev-eks-frontend'
+      TargetType: ip
+      VpcId: !Ref 'Vpc'
+      Port: 8080
+      Protocol: HTTP
+      HealthCheckPath: /health
+      Matcher:
+        HttpCode: '200'
+  DevBackendTarget:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: HasDevAlb
+    Properties:
+      Name: !Sub '${ProjectName}-dev-eks-backend'
+      TargetType: ip
+      VpcId: !Ref 'Vpc'
+      Port: 3000
+      Protocol: HTTP
+      HealthCheckPath: /api/health
+      Matcher:
+        HttpCode: '200'
+  DevHttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: HasDevAlb
+    Properties:
+      LoadBalancerArn: !Ref 'DevAlb'
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+      - Type: forward
+        TargetGroupArn: !Ref 'DevFrontendTarget'
+  DevApiRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Condition: HasDevAlb
+    Properties:
+      ListenerArn: !Ref 'DevHttpListener'
+      Priority: 100
+      Conditions:
+      - Field: path-pattern
+        PathPatternConfig:
+          Values:
+          - /api
+          - /api/*
+      Actions:
+      - Type: forward
+        TargetGroupArn: !Ref 'DevBackendTarget'
+  ProdAlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: HasProdAlb
+    Properties:
+      GroupDescription: TikTo Prod public ALB
+      VpcId: !Ref 'Vpc'
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+      - IpProtocol: tcp
+        FromPort: 8080
+        ToPort: 8080
+        CidrIp: !Ref 'VpcCidr'
+      - IpProtocol: tcp
+        FromPort: 3000
+        ToPort: 3000
+        CidrIp: !Ref 'VpcCidr'
+  ProdAllowFrontend:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasProdAlb
+    Properties:
+      GroupId: !GetAtt 'Cluster.ClusterSecurityGroupId'
+      SourceSecurityGroupId: !Ref 'ProdAlbSecurityGroup'
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+  ProdAllowBackend:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasProdAlb
+    Properties:
+      GroupId: !GetAtt 'Cluster.ClusterSecurityGroupId'
+      SourceSecurityGroupId: !Ref 'ProdAlbSecurityGroup'
+      IpProtocol: tcp
+      FromPort: 3000
+      ToPort: 3000
+  ProdAlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Condition: HasProdAlb
+    DependsOn:
+    - PublicRoute
+    - PublicSubnetARoute
+    - PublicSubnetBRoute
+    - PublicSubnetCRoute
+    Properties:
+      Name: !Sub '${ProjectName}-prod-eks-edge'
+      Type: application
+      Scheme: internet-facing
+      Subnets:
+      - !Ref 'PublicSubnetA'
+      - !Ref 'PublicSubnetB'
+      - !Ref 'PublicSubnetC'
+      SecurityGroups:
+      - !Ref 'ProdAlbSecurityGroup'
+  ProdFrontendTarget:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: HasProdAlb
+    Properties:
+      Name: !Sub '${ProjectName}-prod-eks-frontend'
+      TargetType: ip
+      VpcId: !Ref 'Vpc'
+      Port: 8080
+      Protocol: HTTP
+      HealthCheckPath: /health
+      Matcher:
+        HttpCode: '200'
+  ProdBackendTarget:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: HasProdAlb
+    Properties:
+      Name: !Sub '${ProjectName}-prod-eks-backend'
+      TargetType: ip
+      VpcId: !Ref 'Vpc'
+      Port: 3000
+      Protocol: HTTP
+      HealthCheckPath: /api/health
+      Matcher:
+        HttpCode: '200'
+  ProdGreenTarget:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: HasProdAlb
+    Properties:
+      Name: !Sub '${ProjectName}-prod-eks-backend-green'
+      TargetType: ip
+      VpcId: !Ref 'Vpc'
+      Port: 3000
+      Protocol: HTTP
+      HealthCheckPath: /api/health
+      Matcher:
+        HttpCode: '200'
+  ProdHttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: HasProdAlb
+    Properties:
+      LoadBalancerArn: !Ref 'ProdAlb'
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+      - Type: forward
+        TargetGroupArn: !Ref 'ProdFrontendTarget'
+  ProdApiRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Condition: HasProdAlb
+    Properties:
+      ListenerArn: !Ref 'ProdHttpListener'
+      Priority: 100
+      Conditions:
+      - Field: path-pattern
+        PathPatternConfig:
+          Values:
+          - /api
+          - /api/*
+      Actions:
+      - Type: forward
+        TargetGroupArn: !If [ActiveIsGreen, !Ref 'ProdGreenTarget', !Ref 'ProdBackendTarget']
+  ProdBluePreviewRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Condition: HasPreview
+    Properties:
+      ListenerArn: !Ref 'ProdHttpListener'
+      Priority: 10
+      Conditions:
+      - Field: path-pattern
+        PathPatternConfig:
+          Values:
+          - /api
+          - /api/*
+      - Field: http-header
+        HttpHeaderConfig:
+          HttpHeaderName: X-TikTo-Preview
+          Values:
+          - blue
+      - Field: source-ip
+        SourceIpConfig:
+          Values:
+          - !Ref 'PreviewRunnerCidr'
+      Actions:
+      - Type: forward
+        TargetGroupArn: !Ref 'ProdBackendTarget'
+  ProdGreenPreviewRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Condition: HasPreview
+    Properties:
+      ListenerArn: !Ref 'ProdHttpListener'
+      Priority: 11
+      Conditions:
+      - Field: path-pattern
+        PathPatternConfig:
+          Values:
+          - /api
+          - /api/*
+      - Field: http-header
+        HttpHeaderConfig:
+          HttpHeaderName: X-TikTo-Preview
+          Values:
+          - green
+      - Field: source-ip
+        SourceIpConfig:
+          Values:
+          - !Ref 'PreviewRunnerCidr'
+      Actions:
+      - Type: forward
+        TargetGroupArn: !Ref 'ProdGreenTarget'
+  BackendReleaseRole:
+    Type: AWS::IAM::Role
+    Condition: HasReleaseRole
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Federated: !Ref 'GitHubOidcProviderArn'
+          Action: sts:AssumeRoleWithWebIdentity
+          Condition:
+            StringEquals:
+              token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              token.actions.githubusercontent.com:sub: repo:tikto-calender/manifest:environment:prod
+      Policies:
+      - PolicyName: BackendRelease
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action: elasticloadbalancing:ModifyRule
+            Resource: !Ref 'ProdApiRule'
+          - Effect: Allow
+            Action:
+            - elasticloadbalancing:DescribeRules
+            - elasticloadbalancing:DescribeTargetHealth
+            - cloudwatch:GetMetricStatistics
+            Resource: '*'
+  ApplicationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: HasContainerInsights
+    Properties:
+      LogGroupName: !Sub '/aws/containerinsights/${Cluster}/application'
+      RetentionInDays: !Ref 'LogRetentionDays'
+  PerformanceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: HasContainerInsights
+    Properties:
+      LogGroupName: !Sub '/aws/containerinsights/${Cluster}/performance'
+      RetentionInDays: !Ref 'LogRetentionDays'
+  DataplaneLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: HasContainerInsights
+    Properties:
+      LogGroupName: !Sub '/aws/containerinsights/${Cluster}/dataplane'
+      RetentionInDays: !Ref 'LogRetentionDays'
+  HostLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: HasContainerInsights
+    Properties:
+      LogGroupName: !Sub '/aws/containerinsights/${Cluster}/host'
+      RetentionInDays: !Ref 'LogRetentionDays'
+  CloudWatchRole:
+    Type: AWS::IAM::Role
+    Condition: HasContainerInsights
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: pods.eks.amazonaws.com
+          Action:
+          - sts:AssumeRole
+          - sts:TagSession
+      ManagedPolicyArns:
+      - !Sub 'arn:${AWS::Partition}:iam::aws:policy/CloudWatchAgentServerPolicy'
+  CloudWatchAddon:
+    Type: AWS::EKS::Addon
+    Condition: HasContainerInsights
+    DependsOn:
+    - PodIdentityAgent
+    - ApplicationLogGroup
+    - PerformanceLogGroup
+    - DataplaneLogGroup
+    - HostLogGroup
+    Properties:
+      ClusterName: !Ref 'Cluster'
+      AddonName: amazon-cloudwatch-observability
+      ResolveConflicts: OVERWRITE
+      PodIdentityAssociations:
+      - ServiceAccount: cloudwatch-agent
+        RoleArn: !GetAtt 'CloudWatchRole.Arn'
+  ClusterDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: HasContainerInsights
+    Properties:
+      DashboardName: !Sub '${Cluster}-overview'
+      DashboardBody: !Sub '{"widgets":[{"type":"metric","width":12,"height":6,"properties":{"title":"EKS node utilization","region":"${AWS::Region}","view":"timeSeries","metrics":[["ContainerInsights","node_cpu_utilization","ClusterName","${Cluster}"],["ContainerInsights","node_memory_utilization","ClusterName","${Cluster}"]]}}]}'
+  NodeCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasContainerInsights
+    Properties:
+      Namespace: ContainerInsights
+      MetricName: node_cpu_utilization
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 85
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+      - Name: ClusterName
+        Value: !Ref 'Cluster'
+  NodeMemoryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasContainerInsights
+    Properties:
+      Namespace: ContainerInsights
+      MetricName: node_memory_utilization
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 85
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+      - Name: ClusterName
+        Value: !Ref 'Cluster'
+  FailedNodesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasContainerInsights
+    Properties:
+      Namespace: ContainerInsights
+      MetricName: cluster_failed_node_count
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+      - Name: ClusterName
+        Value: !Ref 'Cluster'
+Outputs:
+  DevFrontendTargetName:
+    Condition: HasDevAlb
+    Value: !GetAtt 'DevFrontendTarget.TargetGroupName'
+  DevBackendTargetName:
+    Condition: HasDevAlb
+    Value: !GetAtt 'DevBackendTarget.TargetGroupName'
+  DevUrl:
+    Condition: HasDevAlb
+    Value: !Sub 'http://${DevAlb.DNSName}'
+  ProdFrontendTargetName:
+    Condition: HasProdAlb
+    Value: !GetAtt 'ProdFrontendTarget.TargetGroupName'
+  ProdBackendTargetName:
+    Condition: HasProdAlb
+    Value: !GetAtt 'ProdBackendTarget.TargetGroupName'
+  ProdGreenTargetName:
+    Condition: HasProdAlb
+    Value: !GetAtt 'ProdGreenTarget.TargetGroupName'
+  ProdUrl:
+    Condition: HasProdAlb
+    Value: !Sub 'http://${ProdAlb.DNSName}'
+  ClusterName:
+    Value: !Ref 'Cluster'
+  VpcId:
+    Value: !Ref 'Vpc'
+  BackendReleaseRoleArn:
+    Condition: HasReleaseRole
+    Value: !GetAtt 'BackendReleaseRole.Arn'
+  BackendReleaseRuleArn:
+    Condition: HasProdAlb
+    Value: !Ref 'ProdApiRule'
+  BackendReleaseBlueArn:
+    Condition: HasProdAlb
+    Value: !Ref 'ProdBackendTarget'
+  BackendReleaseGreenArn:
+    Condition: HasProdAlb
+    Value: !Ref 'ProdGreenTarget'
+  DevDynamoDBTableName:
+    Value: !Ref 'DevTableName'
+  ProdDynamoDBTableName:
+    Value: !Ref 'ProdTableName'
