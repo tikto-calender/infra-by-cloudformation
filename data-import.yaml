@@ -1,0 +1,31 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Import the existing TikTo Calendar production DynamoDB table.
+Parameters:
+  ProjectName:
+    Type: String
+    Default: tikto
+    AllowedPattern: '[a-z][a-z0-9]{1,8}'
+Resources:
+  ProdTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub '${ProjectName}-prod-app'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+      - AttributeName: scope
+        AttributeType: S
+      - AttributeName: id
+        AttributeType: S
+      KeySchema:
+      - AttributeName: scope
+        KeyType: HASH
+      - AttributeName: id
+        KeyType: RANGE
+      DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS

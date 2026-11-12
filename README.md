@@ -1,10 +1,17 @@
 # TikTo on AWS CloudFormation
 
-Two standalone stacks for the existing Helm and Argo CD manifests. Run the examples from this directory in PowerShell with AWS CLI credentials for the intended account. They target Sydney.
+This repository provisions the AWS platform for TikTo Calendar using CloudFormation. The data stack owns the DynamoDB tables. The runtime stack owns the EKS cluster, its networking and the load balancers. Keeping the stacks separate lets you remove the runtime while retaining planner data.
+
+## Prerequisites
+
+Run the examples in PowerShell from this repository's root. You need AWS CLI v2 with credentials for the target account, an IAM role for EKS administration, and your public CIDR. Install kubectl and Helm for workload setup. The examples target Sydney (`ap-southeast-2`).
+
+## Stack templates
 
 | Stack | Creates | When deleted |
 | --- | --- | --- |
 | data.yaml | Two on-demand DynamoDB tables with the existing scope/id keys. Prod has point-in-time recovery and deletion protection. | Both tables are retained. Storage, requests and enabled backup features can still incur charges. |
+| data-import.yaml | Template for importing an existing Prod table into a separate CloudFormation stack. | The imported table is retained. |
 | runtime.yaml | VPC and three public subnets, EKS and managed EC2 workers, Pod Identity, Dev and Prod ALBs and target groups, and optional Container Insights. | Deletes EKS, workers, ALBs and the VPC together. The DynamoDB tables are independent. |
 
 The defaults match the checked-in Helm target group and table names. Runtime has no NAT gateway, defaults to three On-Demand t3.medium nodes and disables optional Container Insights. EKS uses standard support and EKS-managed Kubernetes API data encryption. Runtime does not create a customer-managed KMS key. The two ALBs use HTTP to match the Terraform lab. Put real public traffic behind HTTPS before using this as a production endpoint.
@@ -17,6 +24,10 @@ If the current Terraform deployment already owns the two tables, skip this step 
 $region = 'ap-southeast-2'
 aws cloudformation deploy --region $region --stack-name tikto-data --template-file .\data.yaml
 ```
+
+### Import an existing Prod table
+
+Use `data-import.yaml` with a CloudFormation **IMPORT** change set and map the logical ID `ProdTable` to the existing table name. Check that the table's key schema, billing mode, encryption, deletion protection and point-in-time recovery match the template. Coordinate the handoff if another IaC state still manages the table. After the import completes, run drift detection and pass the imported table name as `ProdTableName` when deploying runtime. [AWS resource import guide](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/import-resources-manually.html)
 
 ## Create runtime
 
@@ -44,12 +55,30 @@ aws cloudformation describe-stacks --region $region --stack-name tikto-runtime `
 ## Bootstrap the workloads
 
 ```powershell
-aws eks update-kubeconfig --region $region --name tikto-prod-eks --role-arn $adminRole
+$cluster = aws cloudformation describe-stacks --region $region --stack-name tikto-runtime `
+  --query "Stacks[0].Outputs[?OutputKey=='ClusterName'].OutputValue | [0]" --output text
+aws eks update-kubeconfig --region $region --name $cluster --role-arn $adminRole
 kubectl config current-context
 kubectl get nodes
 ```
 
-Use the AWS Load Balancer Controller and Argo CD Helm commands in the [existing bootstrap guide](../Infrastructure/README.md). Use VpcId from the CloudFormation outputs for the controller's vpcId value. The runtime stack already associates the controller's service account and both tikto-app service accounts with Pod Identity. Then apply the namespaces and the enabled Argo Applications from [manifest/bootstrap](../manifest/bootstrap). Create the Telegram Secret separately if you need Telegram. The optional Argo Rollouts lab still needs its own controller installation.
+Use the AWS Load Balancer Controller and Argo CD Helm commands from the [controller setup guide](https://github.com/tikto-calender/infra#2-bootstrap-controllers-and-gitops). Set `$vpc` from the CloudFormation `VpcId` output and keep `$cluster` from the command above. The runtime stack already associates the controller's service account and both `tikto-app` service accounts with Pod Identity.
+
+Apply the namespaces and the enabled Argo Applications as described in [Manifest](https://github.com/tikto-calender/manifest#deploy-with-argo-cd). That guide also covers the optional Telegram Secret and the separate controller for the Argo Rollouts lab.
+
+## Verify the application
+
+After Argo CD reports `Synced` and `Healthy`, get the Dev URL and check the frontend and API:
+
+```powershell
+$devUrl = aws cloudformation describe-stacks --region $region --stack-name tikto-runtime `
+  --query "Stacks[0].Outputs[?OutputKey=='DevUrl'].OutputValue | [0]" --output text
+(Invoke-WebRequest "$devUrl/").StatusCode
+Invoke-RestMethod "$devUrl/api/health"
+Invoke-RestMethod "$devUrl/api/status"
+```
+
+Expect HTTP 200 for the frontend and `status: ok` for Backend health. Use `/api/status` to check DynamoDB and Notification Service. If Prod is enabled, repeat these checks using the `ProdUrl` output.
 
 ## Stop runtime charges when done
 
