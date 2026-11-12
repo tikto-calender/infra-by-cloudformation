@@ -1,37 +1,60 @@
-# TikTo on AWS CloudFormation
+# TikTo Infrastructure · CloudFormation
 
-This repository provisions the AWS platform for TikTo Calendar using CloudFormation. The data stack owns the DynamoDB tables. The runtime stack owns the EKS cluster, its networking and the load balancers. Keeping the stacks separate lets you remove the runtime while retaining planner data.
+Repo này dựng hạ tầng AWS cho TikTo Calendar bằng CloudFormation. Stack dữ liệu quản lý DynamoDB. Stack runtime tạo VPC, EKS, node EC2 và ALB cho ứng dụng. Bạn có thể xóa runtime và giữ bảng dữ liệu để dùng lại. Workload được Argo CD triển khai từ [repo Manifest](https://github.com/tikto-calender/manifest).
 
-## Prerequisites
+| Template | Dùng khi nào |
+| --- | --- |
+| [data.yaml](data.yaml) | Tạo mới hai bảng DynamoDB Dev và Prod. Cả hai được giữ khi xóa stack dữ liệu. |
+| [data-import.yaml](data-import.yaml) | Đưa bảng Prod đã tồn tại vào một stack CloudFormation bằng change set `IMPORT`. |
+| [runtime.yaml](runtime.yaml) | Tạo hạ tầng chạy ứng dụng. Mặc định có ba node `t3.medium` và hai ALB. |
 
-Run the examples in PowerShell from this repository's root. You need AWS CLI v2 with credentials for the target account, an IAM role for EKS administration, and your public CIDR. Install kubectl and Helm for workload setup. The examples target Sydney (`ap-southeast-2`).
+## Chuẩn bị
 
-## Stack templates
+- AWS CLI v2 với credentials cho đúng tài khoản, cùng kubectl và Helm.
+- IAM role có thể dùng để quản trị EKS và CIDR IPv4 được phép truy cập Kubernetes API. Các ví dụ dùng vùng Sydney (`ap-southeast-2`).
+- Clone Manifest cạnh repo này để dùng các file bootstrap.
 
-| Stack | Creates | When deleted |
-| --- | --- | --- |
-| data.yaml | Two on-demand DynamoDB tables with the existing scope/id keys. Prod has point-in-time recovery and deletion protection. | Both tables are retained. Storage, requests and enabled backup features can still incur charges. |
-| data-import.yaml | Template for importing an existing Prod table into a separate CloudFormation stack. | The imported table is retained. |
-| runtime.yaml | VPC and three public subnets, EKS and managed EC2 workers, Pod Identity, Dev and Prod ALBs and target groups, and optional Container Insights. | Deletes EKS, workers, ALBs and the VPC together. The DynamoDB tables are independent. |
+**Linux/macOS và Windows PowerShell**
 
-The defaults match the checked-in Helm target group and table names. Runtime has no NAT gateway, defaults to three On-Demand t3.medium nodes and disables optional Container Insights. EKS uses standard support and EKS-managed Kubernetes API data encryption. Runtime does not create a customer-managed KMS key. The two ALBs use HTTP to match the Terraform lab. Put real public traffic behind HTTPS before using this as a production endpoint.
-
-## Create or reuse DynamoDB
-
-If the current Terraform deployment already owns the two tables, skip this step and pass their names to runtime. Creating a stack with the same table names would fail. A retained table stays outside CloudFormation if its data stack is deleted. Reuse it on the next run, or import it explicitly if you want CloudFormation ownership again.
-
-```powershell
-$region = 'ap-southeast-2'
-aws cloudformation deploy --region $region --stack-name tikto-data --template-file .\data.yaml
+```sh
+git clone https://github.com/tikto-calender/infra-by-cloudformation.git
+git clone https://github.com/tikto-calender/manifest.git
+cd infra-by-cloudformation
+aws sts get-caller-identity
 ```
 
-### Import an existing Prod table
+Nếu đã có mã nguồn, mở terminal ở thư mục chứa `runtime.yaml`. Dùng một công cụ quản lý cho cùng bộ tài nguyên. Nếu Terraform đang chạy runtime trùng tên, chuyển quyền quản lý hoặc chọn `ProjectName` và các tên tài nguyên riêng.
 
-Use `data-import.yaml` with a CloudFormation **IMPORT** change set and map the logical ID `ProdTable` to the existing table name. Check that the table's key schema, billing mode, encryption, deletion protection and point-in-time recovery match the template. Coordinate the handoff if another IaC state still manages the table. After the import completes, run drift detection and pass the imported table name as `ProdTableName` when deploying runtime. [AWS resource import guide](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/import-resources-manually.html)
+## 1. Chuẩn bị DynamoDB
 
-## Create runtime
+Nếu cả hai bảng chưa tồn tại, chạy lệnh sau trên **Linux/macOS hoặc Windows PowerShell**.
 
-Use the IAM role ARN that you will authenticate as for kubectl and your actual public CIDR. The example addresses and account ID are placeholders.
+```sh
+aws cloudformation deploy --region ap-southeast-2 --stack-name tikto-data --template-file ./data.yaml
+```
+
+Nếu đã có cả hai bảng, dùng tên của chúng ở bước tạo runtime. Nếu chỉ có bảng Prod, chuẩn bị bảng Dev riêng vì `data.yaml` tạo cả hai tên mặc định. Hai bảng dùng khóa `scope` và `id` kiểu chuỗi.
+
+Để CloudFormation quản lý một bảng Prod đã tồn tại, dùng [data-import.yaml](data-import.yaml) với change set `IMPORT` và ánh xạ logical ID `ProdTable` tới tên bảng. Đối chiếu khóa, billing, mã hóa, deletion protection và point-in-time recovery với bảng thật. Nếu bảng đang nằm trong Terraform state hoặc stack khác, hoàn tất việc chuyển quyền quản lý trước khi import. Sau import, chạy drift detection và dùng tên bảng đó làm `ProdTableName`. [Hướng dẫn import của AWS](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/import-resources-manually.html)
+
+## 2. Tạo runtime
+
+Thay CIDR và role ARN minh họa bằng giá trị của bạn. Sửa `DevTableName` và `ProdTableName` nếu dùng các bảng có tên khác. Các lệnh deploy tạo tài nguyên có tính phí trên AWS.
+
+**Linux/macOS**
+
+```sh
+region='ap-southeast-2'
+admin_cidr='203.0.113.5/32'
+admin_role='arn:aws:iam::123456789012:role/TikToEksOperator'
+
+aws cloudformation deploy --region "$region" --stack-name tikto-runtime \
+  --template-file ./runtime.yaml --capabilities CAPABILITY_IAM \
+  --parameter-overrides "EksAdminCidr=$admin_cidr" "EksAdminRoleArn=$admin_role" \
+    DevTableName=tikto-dev-eks-app ProdTableName=tikto-prod-app
+```
+
+**Windows PowerShell**
 
 ```powershell
 $region = 'ap-southeast-2'
@@ -39,61 +62,104 @@ $adminCidr = '203.0.113.5/32'
 $adminRole = 'arn:aws:iam::123456789012:role/TikToEksOperator'
 
 aws cloudformation deploy --region $region --stack-name tikto-runtime `
-  --template-file .\runtime.yaml --capabilities CAPABILITY_IAM `
+  --template-file ./runtime.yaml --capabilities CAPABILITY_IAM `
   --parameter-overrides "EksAdminCidr=$adminCidr" "EksAdminRoleArn=$adminRole" `
     DevTableName=tikto-dev-eks-app ProdTableName=tikto-prod-app
-
-aws cloudformation describe-stacks --region $region --stack-name tikto-runtime `
-  --query 'Stacks[0].Outputs[].[OutputKey,OutputValue]' --output table
 ```
 
-- For a short Dev-only test, pass EnableProdAlb=false and, if capacity is sufficient, NodeCount=2. Apply only the Dev Application. The default three nodes give both environments more room for surge pods.
-- To test Prod Blue/Green, also supply PreviewRunnerCidr with the trusted runner's real fixed CIDR and GitHubOidcProviderArn with the existing provider ARN. Copy the runtime outputs into the manifest repository's prod Environment variables. Preview rules associate both target groups with the ALB so the inactive target group can report target health.
-- For a rebuild, set ProdActiveSlot to the value in manifest's Prod backend-slot file. GitHub Actions changes the live listener action during promotion. Before updating or replacing this stack, keep ProdActiveSlot aligned with Git and verify the live rule afterwards. CloudFormation can reapply its declared listener action.
-- If the old Terraform runtime is still running, do not create a second runtime with the same names. Either tear down the Terraform runtime under its own ownership first, or use another ProjectName and update the matching table names and target group names in the Helm environment values. Keep Dev and Prod DynamoDB table names distinct.
+Một số tùy chọn thêm vào danh sách `--parameter-overrides`.
 
-## Bootstrap the workloads
+- **Chạy riêng Dev** dùng `EnableProdAlb=false` và chỉ triển khai Application Dev. Có thể dùng `NodeCount=2` nếu đủ sức chứa.
+- **Backend blue/green** dùng `PreviewRunnerCidr` và `GitHubOidcProviderArn`. Hai preview rule giúp ALB kiểm tra cả slot đang chờ. Dùng stack outputs để cấu hình [GitHub Environment `prod` của Manifest](https://github.com/tikto-calender/manifest#configure-backend-bluegreen).
+- **Cập nhật runtime đang chạy Prod** đặt `ProdActiveSlot` bằng giá trị đã xác minh trong `backend-slot` của Manifest. Kiểm tra lại listener sau cập nhật vì CloudFormation có thể áp lại slot được khai báo trong stack.
+
+Xem outputs trên **Linux/macOS hoặc Windows PowerShell**.
+
+```sh
+aws cloudformation describe-stacks --region ap-southeast-2 --stack-name tikto-runtime --query 'Stacks[0].Outputs[].[OutputKey,OutputValue]' --output table
+```
+
+Runtime mặc định không có NAT gateway, dùng mã hóa dữ liệu Kubernetes do EKS quản lý và tắt Container Insights. ALB mẫu dùng HTTP. Dùng HTTPS nếu đưa lưu lượng thật ra Internet.
+
+## 3. Kết nối EKS và cài controller
+
+Giữ terminal từ bước tạo runtime. Nếu AWS CLI đã đăng nhập bằng đúng role quản trị EKS, có thể bỏ `--role-arn` khi cập nhật kubeconfig.
+
+**Linux/macOS**
+
+```sh
+cluster=$(aws cloudformation describe-stacks --region "$region" --stack-name tikto-runtime \
+  --query "Stacks[0].Outputs[?OutputKey=='ClusterName'].OutputValue | [0]" --output text)
+vpc=$(aws cloudformation describe-stacks --region "$region" --stack-name tikto-runtime \
+  --query "Stacks[0].Outputs[?OutputKey=='VpcId'].OutputValue | [0]" --output text)
+aws eks update-kubeconfig --region "$region" --name "$cluster" --role-arn "$admin_role"
+```
+
+**Windows PowerShell**
 
 ```powershell
 $cluster = aws cloudformation describe-stacks --region $region --stack-name tikto-runtime `
   --query "Stacks[0].Outputs[?OutputKey=='ClusterName'].OutputValue | [0]" --output text
+$vpc = aws cloudformation describe-stacks --region $region --stack-name tikto-runtime `
+  --query "Stacks[0].Outputs[?OutputKey=='VpcId'].OutputValue | [0]" --output text
 aws eks update-kubeconfig --region $region --name $cluster --role-arn $adminRole
+```
+
+Kiểm tra context trỏ vào cụm vừa tạo, rồi chạy các lệnh dưới đây trên **Linux/macOS hoặc Windows PowerShell**. Runtime đã cấu hình Pod Identity cho controller và các service account của Backend.
+
+```sh
 kubectl config current-context
 kubectl get nodes
+kubectl apply -f ../manifest/bootstrap/namespaces.yaml
+helm repo add eks https://aws.github.io/eks-charts
+helm repo add argo https://argoproj.github.io/argo-helm
+helm repo update
+helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller --namespace kube-system --version 1.14.0 --wait --set "clusterName=$cluster" --set "region=$region" --set "vpcId=$vpc" --set "serviceAccount.name=aws-load-balancer-controller"
+helm upgrade --install argocd argo/argo-cd --namespace argocd --version 9.4.0 --wait --timeout 10m -f ../manifest/bootstrap/argocd-values.yaml
+kubectl wait --for=condition=Established crd/targetgroupbindings.elbv2.k8s.aws --timeout=120s
 ```
 
-Use the AWS Load Balancer Controller and Argo CD Helm commands from the [controller setup guide](https://github.com/tikto-calender/infra#2-bootstrap-controllers-and-gitops). Set `$vpc` from the CloudFormation `VpcId` output and keep `$cluster` from the command above. The runtime stack already associates the controller's service account and both `tikto-app` service accounts with Pod Identity.
+Tiếp theo, áp dụng Application của các môi trường đã bật theo [hướng dẫn Manifest](https://github.com/tikto-calender/manifest#deploy-with-argo-cd).
 
-Apply the namespaces and the enabled Argo Applications as described in [Manifest](https://github.com/tikto-calender/manifest#deploy-with-argo-cd). That guide also covers the optional Telegram Secret and the separate controller for the Argo Rollouts lab.
+## 4. Kiểm tra qua ALB
 
-## Verify the application
+Sau khi Argo CD báo `Synced` và `Healthy`, lấy URL từ output `DevUrl`. Nếu bật Prod, lặp lại với `ProdUrl`.
 
-After Argo CD reports `Synced` and `Healthy`, get the Dev URL and check the frontend and API:
+**Linux/macOS**
+
+```sh
+url=$(aws cloudformation describe-stacks --region "$region" --stack-name tikto-runtime \
+  --query "Stacks[0].Outputs[?OutputKey=='DevUrl'].OutputValue | [0]" --output text)
+curl -fsS -o /dev/null -w '%{http_code}\n' "$url/"
+curl -fsS "$url/api/health"
+curl -fsS "$url/api/status"
+```
+
+**Windows PowerShell**
 
 ```powershell
-$devUrl = aws cloudformation describe-stacks --region $region --stack-name tikto-runtime `
+$url = aws cloudformation describe-stacks --region $region --stack-name tikto-runtime `
   --query "Stacks[0].Outputs[?OutputKey=='DevUrl'].OutputValue | [0]" --output text
-(Invoke-WebRequest "$devUrl/").StatusCode
-Invoke-RestMethod "$devUrl/api/health"
-Invoke-RestMethod "$devUrl/api/status"
+(Invoke-WebRequest -UseBasicParsing "$url/").StatusCode
+Invoke-RestMethod "$url/api/health"
+Invoke-RestMethod "$url/api/status"
 ```
 
-Expect HTTP 200 for the frontend and `status: ok` for Backend health. Use `/api/status` to check DynamoDB and Notification Service. If Prod is enabled, repeat these checks using the `ProdUrl` output.
+Kỳ vọng trang web trả HTTP 200, `/api/health` báo `ok` và `/api/status` hiển thị trạng thái DynamoDB cùng Notification Service.
 
-## Stop runtime charges when done
+## Xóa runtime khi dùng xong
 
-For a live deployment, schedule downtime first. Confirm the kube context and remove the Argo Applications so they stop recreating bindings. Allow the load balancer controller to clean up before deleting EKS.
+Việc xóa runtime làm ứng dụng ngừng phục vụ. Xác nhận đúng kube context và chỉ chạy các lệnh theo namespace đã triển khai. Với tài nguyên bổ sung như Ingress, LoadBalancer Service hoặc PVC, dọn chúng trong lúc controller vẫn chạy để AWS có thể xóa tài nguyên phụ thuộc.
 
-```powershell
+**Linux/macOS và Windows PowerShell**
+
+```sh
 kubectl config current-context
 kubectl -n argocd delete application tikto-dev tikto-prod --ignore-not-found
-kubectl -n tikto-dev delete targetgroupbindings --all --timeout=3m
-kubectl -n tikto-prod delete targetgroupbindings --all --timeout=3m
-
-aws cloudformation delete-stack --region $region --stack-name tikto-runtime
-aws cloudformation wait stack-delete-complete --region $region --stack-name tikto-runtime
+kubectl -n tikto-dev delete targetgroupbinding backend frontend --ignore-not-found --timeout=3m
+kubectl -n tikto-prod delete targetgroupbinding backend backend-green frontend --ignore-not-found --timeout=3m
+aws cloudformation delete-stack --region ap-southeast-2 --stack-name tikto-runtime
+aws cloudformation wait stack-delete-complete --region ap-southeast-2 --stack-name tikto-runtime
 ```
 
-Run the namespace commands only for namespaces you created. If you added Kubernetes-managed Ingresses, LoadBalancer Services or PVCs, delete them and wait for their AWS resources to clear while controllers are still running. If stack deletion fails, check stack events before retrying.
-
-Leave the data stack intact for the next run. Scaling EC2 down alone leaves the EKS control plane and ALBs billable. After deleting runtime, check for independently created load balancers, disks, retained CloudWatch logs, and any old Terraform resources if you are closing out the account.
+Giữ stack dữ liệu để dùng lại. Nếu stack runtime xóa thất bại, xem stack events trước khi thử lại. Kiểm tra các ALB, ổ đĩa và log được tạo hoặc giữ riêng nếu muốn kết thúc chi phí.
