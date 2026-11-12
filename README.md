@@ -38,7 +38,7 @@ aws cloudformation deploy --region ap-southeast-2 --stack-name tikto-runtime `
     DevTableName=tikto-dev-eks-app ProdTableName=tikto-prod-app
 ```
 
-For a Dev-only runtime, add `EnableProdAlb=false` to the overrides. For Backend blue/green, set `PreviewRunnerCidr` and `GitHubOidcProviderArn`. When updating a live Prod stack, match `ProdActiveSlot` to the verified slot in Manifest.
+For a Dev-only runtime, add `EnableProdAlb=false` to the overrides. If updating an existing two-slot Prod stack, follow the [Backend migration steps](https://github.com/tikto-calender/manifest#migrate-an-existing-backend-deployment) before updating the listener rule.
 
 ## 3. Connect and deploy the app
 

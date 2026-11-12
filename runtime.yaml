@@ -66,22 +66,6 @@ Parameters:
     AllowedValues:
     - 'true'
     - 'false'
-  ProdActiveSlot:
-    Type: String
-    Default: blue
-    AllowedValues:
-    - blue
-    - green
-    Description: Initial Prod listener target. Match the manifest backend-slot when rebuilding.
-  PreviewRunnerCidr:
-    Type: String
-    Default: ''
-    AllowedPattern: ^$|^(?!0[.]0[.]0[.]0/0$)[0-9.]+/([1-9]|[12][0-9]|3[0-2])$
-    Description: Trusted runner IPv4 CIDR. Empty disables preview listener rules.
-  GitHubOidcProviderArn:
-    Type: String
-    Default: ''
-    Description: Existing GitHub OIDC provider ARN. Empty disables the production release role.
   EnableContainerInsights:
     Type: String
     Default: 'false'
@@ -103,17 +87,6 @@ Parameters:
 Conditions:
   HasDevAlb: !Equals [!Ref 'EnableDevAlb', 'true']
   HasProdAlb: !Equals [!Ref 'EnableProdAlb', 'true']
-  ActiveIsGreen: !Equals [!Ref 'ProdActiveSlot', green]
-  HasPreview:
-    Fn::And:
-    - !Condition 'HasProdAlb'
-    - Fn::Not:
-      - !Equals [!Ref 'PreviewRunnerCidr', '']
-  HasReleaseRole:
-    Fn::And:
-    - !Condition 'HasPreview'
-    - Fn::Not:
-      - !Equals [!Ref 'GitHubOidcProviderArn', '']
   HasContainerInsights: !Equals [!Ref 'EnableContainerInsights', 'true']
 Resources:
   Vpc:
@@ -841,18 +814,6 @@ Resources:
       HealthCheckPath: /api/health
       Matcher:
         HttpCode: '200'
-  ProdGreenTarget:
-    Type: AWS::ElasticLoadBalancingV2::TargetGroup
-    Condition: HasProdAlb
-    Properties:
-      Name: !Sub '${ProjectName}-prod-eks-backend-green'
-      TargetType: ip
-      VpcId: !Ref 'Vpc'
-      Port: 3000
-      Protocol: HTTP
-      HealthCheckPath: /api/health
-      Matcher:
-        HttpCode: '200'
   ProdHttpListener:
     Type: AWS::ElasticLoadBalancingV2::Listener
     Condition: HasProdAlb
@@ -877,84 +838,7 @@ Resources:
           - /api/*
       Actions:
       - Type: forward
-        TargetGroupArn: !If [ActiveIsGreen, !Ref 'ProdGreenTarget', !Ref 'ProdBackendTarget']
-  ProdBluePreviewRule:
-    Type: AWS::ElasticLoadBalancingV2::ListenerRule
-    Condition: HasPreview
-    Properties:
-      ListenerArn: !Ref 'ProdHttpListener'
-      Priority: 10
-      Conditions:
-      - Field: path-pattern
-        PathPatternConfig:
-          Values:
-          - /api
-          - /api/*
-      - Field: http-header
-        HttpHeaderConfig:
-          HttpHeaderName: X-TikTo-Preview
-          Values:
-          - blue
-      - Field: source-ip
-        SourceIpConfig:
-          Values:
-          - !Ref 'PreviewRunnerCidr'
-      Actions:
-      - Type: forward
         TargetGroupArn: !Ref 'ProdBackendTarget'
-  ProdGreenPreviewRule:
-    Type: AWS::ElasticLoadBalancingV2::ListenerRule
-    Condition: HasPreview
-    Properties:
-      ListenerArn: !Ref 'ProdHttpListener'
-      Priority: 11
-      Conditions:
-      - Field: path-pattern
-        PathPatternConfig:
-          Values:
-          - /api
-          - /api/*
-      - Field: http-header
-        HttpHeaderConfig:
-          HttpHeaderName: X-TikTo-Preview
-          Values:
-          - green
-      - Field: source-ip
-        SourceIpConfig:
-          Values:
-          - !Ref 'PreviewRunnerCidr'
-      Actions:
-      - Type: forward
-        TargetGroupArn: !Ref 'ProdGreenTarget'
-  BackendReleaseRole:
-    Type: AWS::IAM::Role
-    Condition: HasReleaseRole
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-        - Effect: Allow
-          Principal:
-            Federated: !Ref 'GitHubOidcProviderArn'
-          Action: sts:AssumeRoleWithWebIdentity
-          Condition:
-            StringEquals:
-              token.actions.githubusercontent.com:aud: sts.amazonaws.com
-              token.actions.githubusercontent.com:sub: repo:tikto-calender/manifest:environment:prod
-      Policies:
-      - PolicyName: BackendRelease
-        PolicyDocument:
-          Version: '2012-10-17'
-          Statement:
-          - Effect: Allow
-            Action: elasticloadbalancing:ModifyRule
-            Resource: !Ref 'ProdApiRule'
-          - Effect: Allow
-            Action:
-            - elasticloadbalancing:DescribeRules
-            - elasticloadbalancing:DescribeTargetHealth
-            - cloudwatch:GetMetricStatistics
-            Resource: '*'
   ApplicationLogGroup:
     Type: AWS::Logs::LogGroup
     Condition: HasContainerInsights
@@ -1077,9 +961,6 @@ Outputs:
   ProdBackendTargetName:
     Condition: HasProdAlb
     Value: !GetAtt 'ProdBackendTarget.TargetGroupName'
-  ProdGreenTargetName:
-    Condition: HasProdAlb
-    Value: !GetAtt 'ProdGreenTarget.TargetGroupName'
   ProdUrl:
     Condition: HasProdAlb
     Value: !Sub 'http://${ProdAlb.DNSName}'
@@ -1087,18 +968,6 @@ Outputs:
     Value: !Ref 'Cluster'
   VpcId:
     Value: !Ref 'Vpc'
-  BackendReleaseRoleArn:
-    Condition: HasReleaseRole
-    Value: !GetAtt 'BackendReleaseRole.Arn'
-  BackendReleaseRuleArn:
-    Condition: HasProdAlb
-    Value: !Ref 'ProdApiRule'
-  BackendReleaseBlueArn:
-    Condition: HasProdAlb
-    Value: !Ref 'ProdBackendTarget'
-  BackendReleaseGreenArn:
-    Condition: HasProdAlb
-    Value: !Ref 'ProdGreenTarget'
   DevDynamoDBTableName:
     Value: !Ref 'DevTableName'
   ProdDynamoDBTableName:
